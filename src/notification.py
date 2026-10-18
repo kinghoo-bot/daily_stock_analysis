@@ -2147,9 +2147,15 @@ class NotificationService(
         report_language = self._get_report_language(result)
         labels = get_report_labels(report_language)
 
+        lines.extend([f"### 📈 {labels['market_snapshot_heading']}", ""])
+        data_date = str(snapshot.get('date') or '').strip()
+        if data_date and data_date not in ('未知', 'N/A') and report_language == 'zh':
+            from datetime import date as _date
+            note = f"> 📅 行情数据日期：**{data_date}**（最近交易日）"
+            if data_date[:10] != _date.today().isoformat():
+                note += "；今日休市或未收盘，以下为最近交易日数据"
+            lines.extend([note, ""])
         lines.extend([
-            f"### 📈 {labels['market_snapshot_heading']}",
-            "",
             f"| {labels['close_label']} | {labels['prev_close_label']} | {labels['open_label']} | {labels['high_label']} | {labels['low_label']} | {labels['change_pct_label']} | {labels['change_amount_label']} | {labels['amplitude_label']} | {labels['volume_label']} | {labels['amount_label']} |",
             "|------|------|------|------|------|-------|-------|------|--------|--------|",
             f"| {snapshot.get('close', 'N/A')} | {snapshot.get('prev_close', 'N/A')} | "

@@ -106,6 +106,8 @@ _hk_realtime_cache: Dict[str, Any] = {
     'last_result': None,
 }
 _hk_realtime_cache_lock = threading.Lock()
+# 新浪港股全市场快照缓存（备用链路，单次约40s，避免每只股票重复拉取）
+_hk_sina_spot_cache: Dict[str, Any] = {'data': None, 'timestamp': 0, 'ttl': 1200}
 
 
 def _is_etf_code(stock_code: str) -> bool:
@@ -1788,7 +1790,14 @@ class AkshareFetcher(BaseFetcher):
             import time as _time
             api_start = _time.time()
 
-            df_spot = ak.stock_hk_spot()
+            with _hk_realtime_cache_lock:
+                _c = _hk_sina_spot_cache
+                if _c['data'] is not None and time.time() - _c['timestamp'] < _c['ttl']:
+                    df_spot = _c['data']
+                else:
+                    df_spot = ak.stock_hk_spot()
+                    _c['data'] = df_spot
+                    _c['timestamp'] = time.time()
 
             api_elapsed = _time.time() - api_start
             logger.info(f"[API返回] ak.stock_hk_spot 成功: 返回 {len(df_spot)} 只港股, 耗时 {api_elapsed:.2f}s")

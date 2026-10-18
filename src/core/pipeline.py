@@ -3599,8 +3599,15 @@ class StockAnalysisPipeline:
                     success_count += 1
             fail_count = len(stock_codes) - success_count
         else:
-            success_count = len(results)
+            success_count = sum(1 for r in results if getattr(r, 'success', True))
             fail_count = len(stock_codes) - success_count
+
+        # 全部 AI 分析失败检测：不得伪装成功
+        self._last_all_failed = bool(
+            not dry_run and stock_codes and success_count == 0
+        )
+        self._last_success_count = success_count
+        self._last_fail_count = fail_count
         
         logger.info("===== 分析完成 =====")
         logger.info(f"成功: {success_count}, 失败: {fail_count}, 耗时: {elapsed_time:.2f} 秒")
@@ -3608,6 +3615,25 @@ class StockAnalysisPipeline:
         # 保存报告到本地文件（无论是否推送通知都保存）
         if results and not dry_run:
             self._save_local_report(results, report_type)
+
+        if self._last_all_failed:
+            errors = []
+            for r in results:
+                msg = getattr(r, 'error_message', None)
+                if msg:
+                    errors.append(f"- {getattr(r, 'name', '') or ''}({getattr(r, 'code', '')}): {str(msg)[:200]}")
+            logger.error("❌ 全部 %d 只股票分析失败，本轮不发送正常报告。", len(stock_codes))
+            if send_notification and self.notifier.is_available():
+                body = (
+                    "# ❌ 股票分析失败告警\n\n"
+                    f"本轮 {len(stock_codes)} 只股票 AI 分析全部失败，未生成有效报告。\n\n"
+                    + ("\n".join(errors[:10]) if errors else "（无详细错误信息，请查看 GitHub Actions 日志）")
+                )
+                try:
+                    self.notifier.send(body, email_send_to_all=True, route_type="report")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("发送失败告警出错: %s", exc)
+            return results
 
         # 发送通知（单股推送模式下跳过汇总推送，避免重复）
         if results and send_notification and not dry_run:

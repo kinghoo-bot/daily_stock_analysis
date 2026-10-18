@@ -1130,6 +1130,10 @@ def run_full_analysis(
             and not skip_futu_stock_analysis
         )
         deferred_failure_result = None
+        if expected_stock_report and getattr(pipeline, "_last_all_failed", False):
+            _LAST_ANALYSIS_FAILURE_REASON = "all_failed"
+            logger.error("本轮所有个股 AI 分析均失败，任务标记为失败。")
+            return _return_with_auto_backtest(False)
         if expected_stock_report and results and not getattr(
             pipeline, "_last_local_report_path", None
         ):
@@ -1912,6 +1916,7 @@ def main() -> int:
                         logger.error("启动时分析执行失败，Web/API 服务继续运行。")
                     elif _LAST_ANALYSIS_FAILURE_REASON in {
                         "no_report",
+                        "all_failed",
                         "empty_stock_list",
                         "report_save_failed",
                     }:

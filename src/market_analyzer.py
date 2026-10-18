@@ -1613,20 +1613,23 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             return "\n\n".join(sections)
 
         if self.profile.has_market_stats and self.profile.has_sector_rankings:
-            return """### 三、板块主线
-（区分行业板块与概念题材，分析领涨/领跌背后的逻辑、持续性和是否形成主线）
+            return """### 三、板块主线：领涨领跌板块及原因
+（分别列出领涨、领跌的行业板块和概念题材各前3-5个，逐个说明背后原因（政策、业绩、事件、资金）和持续性判断；无数据时写明“暂无数据”）
 
-### 四、资金与情绪
-（解读成交额、涨跌停结构、市场宽度和风险偏好）
+### 四、资金与情绪：成交额、资金流向与北向资金
+（解读两市成交额水平及含义、涨跌家数与涨跌停结构；北向资金按【港股与跨境资金】如实说明，若官方未披露净买额就直接写“北向净买额未披露”，不得编造数字）
 
-### 五、消息催化
-（结合近三日新闻，提炼真正影响明日交易的催化或扰动）
+### 五、消息催化：指数涨跌原因与关键消息
+（逐一说明主要指数涨跌的直接原因，引用【市场新闻】中的具体事件/政策/数据并注明来源；新闻里找不到原因时直接写“未找到明确消息”，不要编造）
 
-### 六、明日交易计划
-（给出进攻/均衡/防守结论、仓位区间、关注方向、回避方向和一个触发失效条件）
+### 六、港股：恒指、恒生科技与南向资金
+（根据【港股与跨境资金】给出恒生指数、恒生科技指数的点位与涨跌，分析驱动因素；说明南向资金（港股通沪/深）净买额方向和规模及含义；数据缺失时直接说明）
 
-### 七、风险提示
-（列出需要关注的风险点；最后补充“建议仅供参考，不构成投资建议”。）"""
+### 七、次日关注点与交易计划
+（列出明日要盯的3-5个具体事件、数据、板块或点位；给出进攻/均衡/防守结论、仓位区间和一个触发失效条件）
+
+### 八、风险提示
+（列出3-5条具体风险，每条说明触发条件，避免空泛套话；最后补充“建议仅供参考，不构成投资建议”。）"""
 
         numerals = ["一", "二", "三", "四", "五", "六", "七", "八"]
         section_number = 3
@@ -1648,6 +1651,63 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         add_section("明日交易计划", "（给出进攻/均衡/防守结论、仓位区间、关注方向、回避方向和一个触发失效条件）")
         add_section("风险提示", "（列出需要关注的风险点；最后补充“建议仅供参考，不构成投资建议”。）")
         return "\n\n".join(sections)
+
+    def _fetch_cn_extra_market_context(self, timeout_sec: float = 20.0) -> str:
+        """获取港股恒指/恒生科技与沪深港通（北向/南向）资金（akshare 免费接口）。
+
+        任何失败都只返回说明文字，不影响复盘主流程；整体有超时保护。
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _hk_indices() -> List[str]:
+            import akshare as ak
+            df = ak.stock_hk_index_spot_sina()
+            lines = []
+            for code in ("HSI", "HSTECH"):
+                row = df[df["代码"] == code]
+                if row.empty:
+                    continue
+                r = row.iloc[0]
+                lines.append(
+                    f"- {r['名称']}: {float(r['最新价']):.2f} ({float(r['涨跌幅']):+.2f}%)，"
+                    f"开 {float(r['今开']):.2f} 高 {float(r['最高']):.2f} 低 {float(r['最低']):.2f}"
+                )
+            return lines
+
+        def _hsgt_flow() -> List[str]:
+            import akshare as ak
+            df = ak.stock_hsgt_fund_flow_summary_em()
+            lines = []
+            for _, r in df.iterrows():
+                net = float(r.get("成交净买额") or 0)
+                direction = str(r.get("资金方向", ""))
+                if direction == "北向" and abs(net) < 1e-9:
+                    net_text = "官方已不再实时披露北向净买额（数据为0，不可用）"
+                else:
+                    net_text = f"成交净买额 {net:+.2f} 亿元"
+                lines.append(
+                    f"- {r.get('交易日', '')} {r.get('板块', '')}（{direction}）：{net_text}；"
+                    f"{r.get('相关指数', '')} {float(r.get('指数涨跌幅') or 0):+.2f}%"
+                )
+            return lines
+
+        sections = []
+        pool = ThreadPoolExecutor(max_workers=2)
+        try:
+            jobs = {
+                "港股指数（恒指/恒生科技）": pool.submit(_hk_indices),
+                "沪深港通资金（北向/南向）": pool.submit(_hsgt_flow),
+            }
+            for title, fut in jobs.items():
+                try:
+                    lines = fut.result(timeout=timeout_sec)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[大盘] 获取%s失败: %s", title, e)
+                    lines = []
+                sections.append(f"### {title}\n" + ("\n".join(lines) if lines else "- 数据暂不可用（接口获取失败）"))
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        return "## 港股与跨境资金\n" + "\n\n".join(sections)
 
     def _build_review_prompt(self, overview: MarketOverview, news: List) -> str:
         """构建复盘报告 Prompt"""
@@ -1834,6 +1894,13 @@ Output the report content directly, no extra commentary.
 """
 
         # A 股场景使用中文提示语
+        extra_context_block = ""
+        if self.region == "cn":
+            try:
+                extra_context_block = self._fetch_cn_extra_market_context()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[大盘] 附加港股/资金数据失败: %s", e)
+                extra_context_block = "## 港股与跨境资金\n- 数据暂不可用"
         return f"""你是一位专业的{self._get_market_scope_name('zh')}分析师，请根据以下数据生成一份结构化的{self._get_market_scope_name('zh')}大盘复盘报告。
 
 【重要】输出要求：
@@ -1860,6 +1927,8 @@ Output the report content directly, no extra commentary.
 {sector_block}
 
 {data_limits_block}
+
+{extra_context_block}
 
 ## 市场新闻
 {news_placeholder}

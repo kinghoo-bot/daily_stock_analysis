@@ -3621,7 +3621,21 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         # 该行为目前保留（按需求不改逻辑）。
         
         # 获取最近2天数据
-        recent_data = self.get_latest_data(code, days=2)
+        recent_data = self.get_latest_data(code, days=8)
+        # 休市日（周末/节假日）数据源可能返回以当天日期标记的伪K线，
+        # 这里剔除非交易日行，确保使用最近一个真实交易日的数据。
+        try:
+            from src.core.trading_calendar import get_market_for_stock, is_market_open
+            _market = get_market_for_stock(code)
+            if recent_data:
+                _filtered = [r for r in recent_data if r.date.weekday() < 5 and (not _market or is_market_open(_market, r.date))]
+                if _filtered:
+                    if len(_filtered) != len(recent_data):
+                        logger.info(f"{code} 剔除非交易日行情 {len(recent_data) - len(_filtered)} 行，使用最近交易日 {_filtered[0].date}")
+                    recent_data = _filtered
+        except Exception as _exc:  # fail-open
+            logger.debug(f"{code} 交易日过滤失败: {_exc}")
+        recent_data = recent_data[:2]
         
         if not recent_data:
             logger.warning(f"未找到 {code} 的数据")

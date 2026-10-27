@@ -3084,7 +3084,80 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         sanitized = sanitize_hermes_error_text(exc, redaction_values=redactions)
         return redact_diagnostic_text(sanitized, limit=500)
 
+    # 临时性错误（503 高负载 / 429 限流 / 连接或超时）的指数退避重试参数。
+    # 每个模型最多重试 2 次（间隔 20s、45s），全程累计等待上限 900s，
+    # 以保证 5 只股票最坏情况仍在 workflow 45 分钟超时内；耗尽后沿用原有降级/失败逻辑。
+    _TRANSIENT_RETRY_DELAYS = (20, 45)
+    _TRANSIENT_RETRY_MAX_WAIT = 120
+    _TRANSIENT_RETRY_TOTAL_BUDGET = 900
+    _transient_retry_waited = 0.0
+    _DEFAULT_REQUEST_TIMEOUT = 150
+
+    @staticmethod
+    def _is_transient_llm_error(exc: BaseException) -> bool:
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+        if isinstance(status, int) and status in (429, 500, 502, 503, 504):
+            return True
+        name = type(exc).__name__
+        if name in (
+            "RateLimitError", "ServiceUnavailableError", "InternalServerError",
+            "APIConnectionError", "Timeout", "APITimeoutError", "ConnectionError",
+            "ReadTimeout", "ConnectTimeout",
+        ):
+            return True
+        text = str(exc).lower()
+        return any(k in text for k in ("503", "429", "high demand", "overloaded", "rate limit", "resource_exhausted", "timed out"))
+
+    @staticmethod
+    def _retry_after_seconds(exc: BaseException) -> Optional[float]:
+        for holder in (getattr(exc, "response", None), exc):
+            headers = getattr(holder, "headers", None) or getattr(holder, "litellm_response_headers", None)
+            if not headers:
+                continue
+            try:
+                value = headers.get("retry-after") or headers.get("Retry-After")
+                if value:
+                    return float(value)
+            except Exception:
+                continue
+        return None
+
     def _dispatch_litellm_completion(
+        self,
+        model: str,
+        call_kwargs: Dict[str, Any],
+        **kwargs: Any,
+    ) -> Any:
+        """Dispatch a completion, retrying transient errors (503/429/connection/timeout) with backoff."""
+        if call_kwargs.get("stream"):
+            # 流式请求失败会回退到非流式调用（那里有重试），此处不重复等待。
+            return self._dispatch_litellm_completion_once(model, call_kwargs, **kwargs)
+        if not call_kwargs.get("timeout"):
+            call_kwargs = {**call_kwargs, "timeout": self._DEFAULT_REQUEST_TIMEOUT}
+        attempt = 0
+        while True:
+            try:
+                return self._dispatch_litellm_completion_once(model, call_kwargs, **kwargs)
+            except Exception as exc:
+                if attempt >= len(self._TRANSIENT_RETRY_DELAYS) or not self._is_transient_llm_error(exc):
+                    raise
+                delay = float(self._TRANSIENT_RETRY_DELAYS[attempt])
+                retry_after = self._retry_after_seconds(exc)
+                if retry_after is not None and retry_after > 0:
+                    delay = min(retry_after, float(self._TRANSIENT_RETRY_MAX_WAIT))
+                if GeminiAnalyzer._transient_retry_waited + delay > self._TRANSIENT_RETRY_TOTAL_BUDGET:
+                    raise
+                GeminiAnalyzer._transient_retry_waited += delay
+                attempt += 1
+                logger.warning(
+                    "[LiteLLM] %s transient error (%s), retry %d/%d in %.0fs",
+                    model, type(exc).__name__, attempt, len(self._TRANSIENT_RETRY_DELAYS), delay,
+                )
+                time.sleep(delay)
+
+    def _dispatch_litellm_completion_once(
         self,
         model: str,
         call_kwargs: Dict[str, Any],

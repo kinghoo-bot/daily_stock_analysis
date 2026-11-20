@@ -3548,7 +3548,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                 raise item
             yield item
 
-        def _consume_litellm_stream(
+    def _consume_litellm_stream(
         self,
         stream_response: Any,
         *,

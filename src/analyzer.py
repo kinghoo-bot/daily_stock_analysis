@@ -13,7 +13,9 @@ A股自选股智能分析系统 - AI分析层
 import json
 import logging
 import math
+import queue
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple, Callable, Union
@@ -3092,6 +3094,9 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
     _TRANSIENT_RETRY_TOTAL_BUDGET = 900
     _transient_retry_waited = 0.0
     _DEFAULT_REQUEST_TIMEOUT = 150
+    # 流式响应超过该时间无任何 chunk 到达即判定为停滞：调用方会按原有
+    # 逻辑回退到非流式重试/备用模型，而不是无限等下去拖垮整个任务。
+    _STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 
     @staticmethod
     def _is_transient_llm_error(exc: BaseException) -> bool:
@@ -3506,7 +3511,44 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 
         return content if isinstance(content, str) else ""
 
-    def _consume_litellm_stream(
+    @staticmethod    
+    def _iter_stream_chunks(stream_response: Any, *, idle_timeout_seconds: float) -> Any:
+        """Yield stream chunks, raising TimeoutError if the stream stalls.
+        The producer runs on a daemon thread so a hung stream can never
+        block the run or interpreter shutdown; the timeout only abandons
+        the local iteration and the caller falls back to a non-stream
+        request through the existing retry path.
+        """
+        sentinel = object()
+        chunk_queue: "queue.Queue[Any]" = queue.Queue()
+
+        def _pump() -> None:
+            try:
+                for item in stream_response:
+                    chunk_queue.put(item)
+                chunk_queue.put(sentinel)
+            except BaseException as exc:  # noqa: BLE001 - forwarded to the consumer
+                chunk_queue.put(exc)
+
+        pump_thread = threading.Thread(
+            target=_pump, name="litellm-stream-pump", daemon=True
+        )
+        pump_thread.start()
+        while True:
+            try:
+                item = chunk_queue.get(timeout=idle_timeout_seconds)
+            except queue.Empty:
+                raise TimeoutError(
+                    "stream stalled: no chunk received for "
+                    f"{idle_timeout_seconds:.0f}s (timed out)"
+                )
+            if item is sentinel:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+        def _consume_litellm_stream(
         self,
         stream_response: Any,
         *,
@@ -3522,7 +3564,10 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         next_emit_at = 1
 
         try:
-            for chunk in stream_response:
+            for chunk in self._iter_stream_chunks(
+                stream_response,
+                idle_timeout_seconds=self._STREAM_IDLE_TIMEOUT_SECONDS,
+            ):
                 chunk_usage = extract_usage_payload(chunk)
                 normalized_usage = self._normalize_usage(
                     chunk_usage,
